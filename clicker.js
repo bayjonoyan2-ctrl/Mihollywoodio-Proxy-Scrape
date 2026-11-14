@@ -4,7 +4,6 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
 
 // ======================= PROXIES FROM SECRET =======================
-// SCRAPEPROXY_PROXIES format: username:password@ip:port  (one per line)
 function buildProxyListFromEnv() {
   const raw = (process.env.SCRAPEPROXY_PROXIES || '').trim();
   if (!raw) {
@@ -144,25 +143,23 @@ const BROWSE_SITES = [
   'https://www.politico.com/'
 ];
 
-// ============ DATA SAVER (ad-aware) ============
-function isAdDomain(url) {
-  const adDomains = [
-    'googlesyndication.com', 'googleads.g.doubleclick.net', 'doubleclick.net',
-    'googletagmanager.com', 'google-analytics.com', 'adservice.google.com',
-    'googletagservices.com', 'pagead2.googlesyndication.com',
-    'tpc.googlesyndication.com', 'securepubads.g.doubleclick.net',
-    'amazon-adsystem.com', 'adsafeprotected.com', 'moatads.com'
-  ];
-  return adDomains.some(d => url.includes(d));
-}
-
+// ============ DATA SAVER (frame-aware) ============
+// Only block heavy stuff on TOP-LEVEL page. Inside ad iframes, let everything load
+// so the creative renders and the <a> link appears.
 async function applyDataSaver(page) {
   await page.route('**/*', (route) => {
+    let isInIframe = false;
+    try {
+      const frame = route.request().frame();
+      isInIframe = !!(frame && frame.parentFrame());
+    } catch (e) {}
+
+    if (isInIframe) return route.continue();
+
     const type = route.request().resourceType();
-    const url = route.request().url();
-    if (['media', 'font', 'manifest', 'texttrack'].includes(type)) return route.abort();
-    if (type === 'stylesheet' && !isAdDomain(url)) return route.abort();
-    if (type === 'image' && !isAdDomain(url)) return route.abort();
+    if (['media', 'font', 'manifest', 'texttrack'].includes(type)) {
+      return route.abort();
+    }
     return route.continue();
   });
 }
@@ -197,7 +194,8 @@ async function readPage(page, label = 'reading', minSec = 20, maxSec = 35) {
 
 async function tryClickOneAd(page, label = 'ad') {
   try { await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {}); } catch (e) {}
-  await sleep(rand(4000, 7000));
+  // Give ad scripts extra time to fully render the clickable <a> inside the iframe
+  await sleep(rand(5000, 9000));
 
   const attrs = ['src', 'id', 'name', 'class', 'title'];
   const shuffled = [...IFRAME_MATCHERS].sort(() => Math.random() - 0.5);
@@ -222,11 +220,12 @@ async function tryClickOneAd(page, label = 'ad') {
       try { frame = await frameEl.contentFrame(); } catch (e) { continue; }
       if (!frame) continue;
 
+      // Retry up to 4 times (~12s) waiting for clickable link to appear in the ad iframe
       let links = [];
-      try { links = await frame.$$('a[href]'); } catch (e) { continue; }
-      if (!links.length) {
-        await sleep(rand(2000, 4000));
-        try { links = await frame.$$('a[href]'); } catch (e) { continue; }
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try { links = await frame.$$('a[href]'); } catch (e) { links = []; }
+        if (links.length) break;
+        await sleep(rand(2500, 3500));
       }
       if (!links.length) continue;
 
@@ -284,7 +283,6 @@ async function visitExternalSite(page, label) {
   }
 }
 
-// Determine if a proxy error is a HARD failure (dead) vs soft (slow but alive)
 function isHardProxyFailure(errMsg) {
   const hard = [
     'ERR_PROXY_AUTH',
@@ -307,7 +305,6 @@ async function tryProxy(browser, proxyObj, ua, referer, viewport) {
     });
     const page = await context.newPage();
     await applyDataSaver(page);
-    // 60s timeout — gives far/slow proxies a fair chance
     await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded', timeout: 60000 });
     const body = await page.textContent('body');
     console.log(`DIAG: proxy ${proxyObj.label} OK, exit IP =`, body.trim());
