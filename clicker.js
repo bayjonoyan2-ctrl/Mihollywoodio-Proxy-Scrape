@@ -10,10 +10,7 @@ function buildProxyListFromEnv() {
     console.log('DIAG: SCRAPEPROXY_PROXIES secret is empty or missing');
     return [];
   }
-  const lines = raw
-    .split(/\r?\n/)
-    .map(l => l.trim())
-    .filter(l => l && l.includes('@'));
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l && l.includes('@'));
 
   const valid = [];
   for (const line of lines) {
@@ -22,21 +19,13 @@ function buildProxyListFromEnv() {
       if (atIndex < 0) continue;
       const creds = line.substring(0, atIndex);
       const hostPort = line.substring(atIndex + 1);
-
       const colonIndex = creds.indexOf(':');
       if (colonIndex < 0) continue;
       const username = creds.substring(0, colonIndex);
       const password = creds.substring(colonIndex + 1);
-
       const [host, port] = hostPort.split(':');
       if (!host || !port) continue;
-
-      valid.push({
-        server: `http://${host}:${port}`,
-        username,
-        password,
-        label: `${host}:${port}`
-      });
+      valid.push({ server: `http://${host}:${port}`, username, password, label: `${host}:${port}` });
     } catch (e) {
       console.log('DIAG: skipping malformed proxy line:', line.slice(0, 30) + '...');
     }
@@ -46,7 +35,6 @@ function buildProxyListFromEnv() {
 
 const ALL_PROXIES = buildProxyListFromEnv();
 console.log(`DIAG: total proxies loaded from secret = ${ALL_PROXIES.length}`);
-// ====================================================================
 
 console.log('DIAG: SITE_URL =', JSON.stringify(process.env.SITE_URL));
 console.log('DIAG: node version =', process.version);
@@ -120,13 +108,6 @@ const USER_AGENTS = [
   'Mozilla/5.0 (iPad; CPU OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1'
 ];
 
-const IFRAME_MATCHERS = [
-  { src: 'googleads' },
-  { src: 'doubleclick' },
-  { src: 'googlesyndication' },
-  { src: 'ca-pub-' }
-];
-
 const BROWSE_SITES = [
   'https://www.imdb.com/', 'https://www.rottentomatoes.com/', 'https://www.metacritic.com/',
   'https://www.boxofficemojo.com/', 'https://www.themoviedb.org/', 'https://letterboxd.com/',
@@ -144,8 +125,6 @@ const BROWSE_SITES = [
 ];
 
 // ============ DATA SAVER (frame-aware) ============
-// Only block heavy stuff on TOP-LEVEL page. Inside ad iframes, let everything load
-// so the creative renders and the <a> link appears.
 async function applyDataSaver(page) {
   await page.route('**/*', (route) => {
     let isInIframe = false;
@@ -153,17 +132,12 @@ async function applyDataSaver(page) {
       const frame = route.request().frame();
       isInIframe = !!(frame && frame.parentFrame());
     } catch (e) {}
-
     if (isInIframe) return route.continue();
-
     const type = route.request().resourceType();
-    if (['media', 'font', 'manifest', 'texttrack'].includes(type)) {
-      return route.abort();
-    }
+    if (['media', 'font', 'manifest', 'texttrack'].includes(type)) return route.abort();
     return route.continue();
   });
 }
-// ===============================================
 
 async function fetchArticleUrlsFromFeed(siteUrl) {
   try {
@@ -192,50 +166,86 @@ async function readPage(page, label = 'reading', minSec = 20, maxSec = 35) {
   }
 }
 
+// ---- THE NEW AD CLICKER ----
+// 1. Scrolls the page so lazy-loaded ad iframes render
+// 2. Waits longer for ad scripts to inject the <a>
+// 3. Searches ALL iframes for ANY link — not just src-matching ones
+// 4. Falls back to clicking the iframe body itself if no <a> exists
 async function tryClickOneAd(page, label = 'ad') {
-  try { await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {}); } catch (e) {}
-  // Give ad scripts extra time to fully render the clickable <a> inside the iframe
-  await sleep(rand(5000, 9000));
+  try { await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {}); } catch (e) {}
+
+  // Scroll down and back up so lazy ad slots enter the viewport and load
+  try {
+    for (let s = 0; s < 6; s++) {
+      await page.mouse.wheel(0, rand(400, 900));
+      await sleep(rand(800, 1600));
+    }
+    await sleep(rand(2000, 3000));
+    for (let s = 0; s < 5; s++) {
+      await page.mouse.wheel(0, -rand(400, 900));
+      await sleep(rand(600, 1200));
+    }
+  } catch (e) {}
+
+  await sleep(rand(4000, 8000));
 
   const attrs = ['src', 'id', 'name', 'class', 'title'];
-  const shuffled = [...IFRAME_MATCHERS].sort(() => Math.random() - 0.5);
+  const AD_SRC_MATCHERS = ['googleads', 'doubleclick', 'googlesyndication', 'ca-pub-', 'adservice', 'adsystem', 'adnxs', 'amazon-adsystem'];
 
-  for (const matcher of shuffled) {
-    let iframes = [];
-    try { iframes = await page.$$('iframe'); } catch (e) { return false; }
-    console.log(`  [${label}] found ${iframes.length} iframes on page`);
-    for (const frameEl of iframes) {
-      let ok = true;
-      for (const key of attrs) {
-        if (matcher[key] !== undefined) {
-          try {
-            const val = (await frameEl.getAttribute(key)) || '';
-            if (!val.includes(matcher[key])) { ok = false; break; }
-          } catch (e) { ok = false; break; }
-        }
-      }
-      if (!ok) continue;
+  let iframes = [];
+  try { iframes = await page.$$('iframe'); } catch (e) { return false; }
+  console.log(`  [${label}] found ${iframes.length} iframes on page`);
 
-      let frame;
-      try { frame = await frameEl.contentFrame(); } catch (e) { continue; }
-      if (!frame) continue;
+  // Score each iframe: ad-URL iframes first, then anything with a link inside
+  const candidates = [];
 
-      // Retry up to 4 times (~12s) waiting for clickable link to appear in the ad iframe
-      let links = [];
-      for (let attempt = 0; attempt < 4; attempt++) {
-        try { links = await frame.$$('a[href]'); } catch (e) { links = []; }
-        if (links.length) break;
-        await sleep(rand(2500, 3500));
-      }
-      if (!links.length) continue;
+  for (const frameEl of iframes) {
+    let srcAttr = '';
+    try { srcAttr = (await frameEl.getAttribute('src')) || ''; } catch (e) {}
+    let idAttr = '';
+    try { idAttr = (await frameEl.getAttribute('id')) || ''; } catch (e) {}
+    let nameAttr = '';
+    try { nameAttr = (await frameEl.getAttribute('name')) || ''; } catch (e) {}
 
+    let isAdLike = false;
+    for (const m of AD_SRC_MATCHERS) {
+      if (srcAttr.includes(m) || idAttr.includes(m) || nameAttr.includes(m)) { isAdLike = true; break; }
+    }
+
+    let frame;
+    try { frame = await frameEl.contentFrame(); } catch (e) { continue; }
+    if (!frame) continue;
+
+    candidates.push({ frameEl, frame, isAdLike, srcAttr, idAttr });
+  }
+
+  // Sort: ad-like first, then by src presence
+  candidates.sort((a, b) => (b.isAdLike ? 1 : 0) - (a.isAdLike ? 1 : 0));
+
+  // Try every candidate — give each a decent wait for the <a> to appear
+  for (const c of candidates) {
+    // Extra scroll to bring this iframe into view (helps lazy ads)
+    try {
+      await c.frameEl.scrollIntoViewIfNeeded().catch(() => {});
+      await sleep(rand(1000, 2000));
+    } catch (e) {}
+
+    // Wait up to ~15s for a clickable link inside this iframe
+    let links = [];
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try { links = await c.frame.$$('a[href]'); } catch (e) { links = []; }
+      if (links.length) break;
+      await sleep(rand(2000, 3000));
+    }
+
+    if (links.length) {
       const link = links[rand(0, links.length - 1)];
       try {
         const [popup] = await Promise.all([
           page.context().waitForEvent('page', { timeout: 8000 }).catch(() => null),
           link.click({ timeout: 5000 })
         ]);
-        console.log(`  [${label}] clicked ad matching`, JSON.stringify(matcher));
+        console.log(`  [${label}] clicked LINK inside iframe (${c.srcAttr.slice(0, 60) || c.idAttr})`);
         if (popup) {
           await applyDataSaver(popup).catch(() => {});
           await popup.waitForLoadState('domcontentloaded').catch(() => {});
@@ -246,12 +256,52 @@ async function tryClickOneAd(page, label = 'ad') {
           try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 15000 }); } catch (e) { }
         }
         return true;
-      } catch (e) { }
+      } catch (e) {
+        console.log(`  [${label}] link click failed:`, (e.message || '').split('\n')[0]);
+      }
+    } else {
+      // No <a> found. As a last resort on ad-like iframes, try clicking inside
+      // the iframe body directly — some ad creatives use JS click handlers.
+      if (c.isAdLike) {
+        try {
+          const body = await c.frame.$('body').catch(() => null);
+          if (body) {
+            const box = await body.boundingBox().catch(() => null);
+            if (box && box.width > 5 && box.height > 5) {
+              // Click near the center of the iframe area on the top page
+              const elBox = await c.frameEl.boundingBox().catch(() => null);
+              if (elBox) {
+                await page.mouse.click(
+                  elBox.x + elBox.width / 2,
+                  elBox.y + elBox.height / 2
+                );
+                console.log(`  [${label}] clicked ad iframe body directly (${c.srcAttr.slice(0, 60)})`);
+                await sleep(rand(3000, 6000));
+                const [popupAfter] = await Promise.all([
+                  page.context().waitForEvent('page', { timeout: 4000 }).catch(() => null),
+                  Promise.resolve()
+                ]);
+                if (popupAfter) {
+                  await applyDataSaver(popupAfter).catch(() => {});
+                  await popupAfter.waitForLoadState('domcontentloaded').catch(() => {});
+                  await readPage(popupAfter, 'ad-page', 15, 20);
+                  try { await popupAfter.close(); } catch (e) { }
+                  return true;
+                }
+                // Even if no popup, count it — the click reached the ad
+                return true;
+              }
+            }
+          }
+        } catch (e) {}
+      }
     }
   }
+
   console.log(`  [${label}] no clickable ad found`);
   return false;
 }
+// --------------------------
 
 async function visitExternalSite(page, label) {
   const site = BROWSE_SITES[rand(0, BROWSE_SITES.length - 1)];
@@ -262,8 +312,7 @@ async function visitExternalSite(page, label) {
     if (Math.random() < 0.5) {
       try {
         const links = await page.$$eval('a[href]', els =>
-          [...new Set(els.map(a => a.href))]
-            .filter(h => h.startsWith('http') && !h.includes('javascript')));
+          [...new Set(els.map(a => a.href))].filter(h => h.startsWith('http') && !h.includes('javascript')));
         if (links.length) {
           const pick = links[rand(0, links.length - 1)];
           console.log(`[${label}] clicking article:`, pick);
@@ -284,16 +333,7 @@ async function visitExternalSite(page, label) {
 }
 
 function isHardProxyFailure(errMsg) {
-  const hard = [
-    'ERR_PROXY_AUTH',
-    'ERR_TUNNEL_CONNECTION_FAILED',
-    'ERR_CONNECTION_REFUSED',
-    'ERR_NAME_NOT_RESOLVED',
-    'ERR_INVALID_AUTH_CREDENTIALS',
-    'ERR_SOCKS_CONNECTION_FAILED',
-    '407'
-  ];
-  return hard.some(h => errMsg.includes(h));
+  return ['ERR_PROXY_AUTH','ERR_TUNNEL_CONNECTION_FAILED','ERR_CONNECTION_REFUSED','ERR_NAME_NOT_RESOLVED','ERR_INVALID_AUTH_CREDENTIALS','ERR_SOCKS_CONNECTION_FAILED','407'].some(h => errMsg.includes(h));
 }
 
 async function tryProxy(browser, proxyObj, ua, referer, viewport) {
@@ -319,25 +359,19 @@ async function tryProxy(browser, proxyObj, ua, referer, viewport) {
 
 async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
   const shuffled = [...ALL_PROXIES].sort(() => Math.random() - 0.5);
-  let tried = 0;
-  let lastError = '';
-
+  let tried = 0, lastError = '';
   for (const proxyObj of shuffled) {
     tried++;
     console.log(`DIAG: trying proxy ${proxyObj.label} (${tried}/${shuffled.length})`);
     const result = await tryProxy(browser, proxyObj, ua, referer, viewport);
-    if (!result || result.error) {
-      lastError = result && result.error ? result.error : 'proxy unreachable';
-      continue;
-    }
+    if (!result || result.error) { lastError = result && result.error ? result.error : 'proxy unreachable'; continue; }
     try {
       await result.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
       console.log('DIAG: home url =', result.page.url());
       if (result.page.url().includes('google.com/sorry')) {
         console.log('DIAG: CAPTCHA on this proxy, trying next');
         try { await result.context.close(); } catch (_) {}
-        lastError = 'CAPTCHA';
-        continue;
+        lastError = 'CAPTCHA'; continue;
       }
       return result;
     } catch (e) {
@@ -349,43 +383,14 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
       try { await result.context.close(); } catch (_) {}
     }
   }
-
-  console.log('');
-  console.log('======================================================================');
-  console.log('🚨🚨🚨  ALL SCRAPEPROXY PROXIES FAILED  🚨🚨🚨');
-  console.log('----------------------------------------------------------------------');
-  console.log(`Tried all ${tried} proxies, none could reach the target site.`);
-  console.log(`Last error: ${lastError || 'unknown'}`);
-  console.log('');
-  console.log('Most likely reasons:');
-  console.log('  1. Your ScrapeProxy traffic pool is exhausted.');
-  console.log('  2. Your ScrapeProxy plan has expired.');
-  console.log('  3. Credentials / IPs were rotated by ScrapeProxy.');
-  console.log('');
-  console.log('👉 ACTION REQUIRED:');
-  console.log('   - Log into proxyscrape.com and check traffic + plan status.');
-  console.log('   - Get a fresh proxy list (username:password@ip:port, one per line).');
-  console.log('   - Repo → Settings → Secrets and variables → Actions');
-  console.log('     → Update SCRAPEPROXY_PROXIES secret with the new list.');
-  console.log('   - Re-run this workflow.');
-  console.log('======================================================================');
-  console.log('');
-
+  console.log('\n======================================================================\n🚨🚨🚨  ALL SCRAPEPROXY PROXIES FAILED  🚨🚨🚨\n----------------------------------------------------------------------');
+  console.log(`Tried all ${tried} proxies. Last error: ${lastError || 'unknown'}`);
+  console.log('👉 ACTION: Update SCRAPEPROXY_PROXIES secret in repo settings.\n======================================================================\n');
   return null;
 }
 
 (async () => {
-  if (!ALL_PROXIES.length) {
-    console.log('');
-    console.log('======================================================================');
-    console.log('🚨  NO PROXIES CONFIGURED');
-    console.log('----------------------------------------------------------------------');
-    console.log('The SCRAPEPROXY_PROXIES secret is empty or has no valid lines.');
-    console.log('Add it in: Repo → Settings → Secrets and variables → Actions');
-    console.log('Format: username:password@ip:port  (one per line)');
-    console.log('======================================================================');
-    process.exit(1);
-  }
+  if (!ALL_PROXIES.length) { console.log('🚨 NO PROXIES CONFIGURED — add SCRAPEPROXY_PROXIES secret.'); process.exit(1); }
 
   const randomReferer = REFERRERS[rand(0, REFERRERS.length - 1)];
   const randomUA = USER_AGENTS[rand(0, USER_AGENTS.length - 1)];
@@ -403,20 +408,15 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
       '--disable-web-security',
       '--disable-site-isolation-trials',
       '--disable-features=IsolateOrigins,site-per-process',
-      '--disable-dev-shm-usage',
-      '--no-sandbox'
+      '--disable-dev-shm-usage', '--no-sandbox'
     ]
   });
 
   const result = await pickWorkingProxy(browser, randomUA, randomReferer, viewport, process.env.SITE_URL);
-  if (!result) {
-    await browser.close();
-    process.exit(1);
-  }
+  if (!result) { await browser.close(); process.exit(1); }
 
   const { context, page } = result;
 
-  // ===== STEP 1: 2-4 external sites =====
   const preSites = rand(2, 4);
   console.log(`--- STEP 1: ${preSites} external sites ---`);
   for (let i = 0; i < preSites; i++) {
@@ -424,7 +424,6 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
     await visitExternalSite(page, `ext${i + 1}`);
   }
 
-  // ===== STEP 2: my site + 3-6 articles + 2-4 ads =====
   console.log('--- STEP 2: target site ---');
   const targetAds = rand(2, 4);
   let adsClicked = 0;
@@ -434,10 +433,7 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
     if (adsClicked >= targetAds) return;
     console.log(`--- ad attempt on ${label} (${adsClicked}/${targetAds} so far) ---`);
     const ok = await tryClickOneAd(page, label);
-    if (ok) {
-      adsClicked++;
-      console.log(`DIAG: ad click counted (${adsClicked}/${targetAds})`);
-    }
+    if (ok) { adsClicked++; console.log(`DIAG: ad click counted (${adsClicked}/${targetAds})`); }
   }
 
   try {
@@ -453,7 +449,6 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
 
   const articlesToRead = rand(3, 6);
   console.log(`DIAG: articlesToRead = ${articlesToRead}`);
-
   const shuffledArticles = [...articleUrls].sort(() => Math.random() - 0.5);
   let captchaHit = false;
 
@@ -462,21 +457,14 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
     const url = shuffledArticles[i];
     console.log(`--- article ${i + 1}/${articlesToRead} ---`);
     console.log('reading:', url);
-    try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    } catch (e) {
+    try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }); }
+    catch (e) {
       console.log('article goto failed:', e.message.split('\n')[0]);
       try { await page.goto('about:blank', { timeout: 5000 }).catch(() => {}); } catch (_) {}
-      await sleep(500);
-      captchaHit = true;
-      break;
+      await sleep(500); captchaHit = true; break;
     }
     console.log('DIAG: article url after goto =', page.url());
-    if (page.url().includes('google.com/sorry')) {
-      console.log('CAPTCHA, stopping');
-      captchaHit = true;
-      break;
-    }
+    if (page.url().includes('google.com/sorry')) { console.log('CAPTCHA, stopping'); captchaHit = true; break; }
     await readPage(page, 'article', 20, 35);
     await tryReachAdQuota(`article-${i + 1}`);
     await sleep(rand(10000, 20000));
@@ -491,7 +479,6 @@ async function pickWorkingProxy(browser, ua, referer, viewport, targetUrl) {
     }
   }
 
-  // ===== STEP 3: 1-3 external sites =====
   const postSites = rand(1, 3);
   console.log(`--- STEP 3: ${postSites} external sites ---`);
   for (let i = 0; i < postSites; i++) {
